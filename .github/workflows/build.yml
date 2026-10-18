@@ -110,22 +110,37 @@ jobs:
           echo "ARTIFACT_SUFFIX=${{ needs.fetch-info.outputs.build_type }}" >> $GITHUB_OUTPUT
 
       - name: Decode Keystore for release
+        id: keystore
         if: needs.fetch-info.outputs.build_type != 'development'
         env:
           ENCODED_STRING: ${{ secrets.KEYSTORE_BASE_64 }}
           RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           RELEASE_KEYSTORE_ALIAS: ${{ secrets.RELEASE_KEYSTORE_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          echo "$ENCODED_STRING" | base64 -d > android/app/keystore.jks
+          set -euo pipefail
 
-          # Create the key.properties file
+          if [ -z "${ENCODED_STRING:-}" ]; then
+            echo "::warning::No release keystore configured; release artifacts will be debug-signed."
+            rm -f android/app/keystore.jks android/app/key.properties
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          test -n "$RELEASE_KEYSTORE_PASSWORD" || { echo "::error::RELEASE_KEYSTORE_PASSWORD is missing"; exit 1; }
+          test -n "$RELEASE_KEYSTORE_ALIAS" || { echo "::error::RELEASE_KEYSTORE_ALIAS is missing"; exit 1; }
+          test -n "$RELEASE_KEY_PASSWORD" || { echo "::error::RELEASE_KEY_PASSWORD is missing"; exit 1; }
+
+          printf '%s' "$ENCODED_STRING" | base64 --decode > android/app/keystore.jks
+          test -s android/app/keystore.jks || { echo "::error::Decoded keystore is empty"; exit 1; }
+
           cat > android/app/key.properties <<EOF
           storePassword=$RELEASE_KEYSTORE_PASSWORD
           keyPassword=$RELEASE_KEY_PASSWORD
           keyAlias=$RELEASE_KEYSTORE_ALIAS
           EOF
+
+          echo "configured=true" >> "$GITHUB_OUTPUT"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -134,6 +149,27 @@ jobs:
           java-version: "17"
           cache: "gradle"
           check-latest: true
+
+      - name: Verify release keystore
+        if: needs.fetch-info.outputs.build_type != 'development' && steps.keystore.outputs.configured == 'true'
+        env:
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEYSTORE_ALIAS: ${{ secrets.RELEASE_KEYSTORE_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          file android/app/keystore.jks
+
+          keytool -list \
+            -keystore android/app/keystore.jks \
+            -storepass "$RELEASE_KEYSTORE_PASSWORD" \
+            -alias "$RELEASE_KEYSTORE_ALIAS"
+
+          keytool -certreq \
+            -keystore android/app/keystore.jks \
+            -storepass "$RELEASE_KEYSTORE_PASSWORD" \
+            -alias "$RELEASE_KEYSTORE_ALIAS" \
+            -keypass "$RELEASE_KEY_PASSWORD" >/dev/null
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2.19.0
@@ -662,6 +698,7 @@ jobs:
       - create_release
       - build-android
     runs-on: ubuntu-latest
+    if: github.repository == 'DonutWare/Fladder' && needs.fetch-info.outputs.build_type != 'development'
     steps:
       - name: Download Artifacts Android
         uses: actions/download-artifact@v4
